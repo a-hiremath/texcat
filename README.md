@@ -82,7 +82,7 @@ texcat --viewer                      # opens a new terminal window running the v
 texcat --send 'e^{i\pi} + 1 = 0'     # from anywhere — your agent, a script, vim — renders instantly
 ```
 
-Tell your AI agent to `texcat --send` its display math and you get an Overleaf-quality math sidebar for your conversation. Renders are logged to `~/.cache/texcat/viewer.log`, so even a headless agent can verify its math actually displayed.
+Tell your AI agent to `texcat --send` its display math and you get an Overleaf-quality math sidebar for your conversation. Renders are logged to `~/.cache/texcat/viewer.log` — that log is the **only** confirmation a render displayed (`--send` returns 0 as soon as the entry is queued, and warns on stderr if no viewer is listening). Agent workflow notes: the log lags a send by up to ~1s (poll a couple of seconds before concluding a render failed — empty means *not yet*, not *failed*), and a viewer started after sends skips old entries unless launched with `--listen --replay N`.
 
 ## Math-native Claude (or any LLM CLI)
 

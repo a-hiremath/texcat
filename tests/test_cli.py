@@ -130,3 +130,55 @@ def test_render_png_raises_on_bad_tex(tmp_path, monkeypatch):
     with pytest.raises(cli.TexError):
         cli.render_png("\\[ \\frac{unclosed \\]", dpi=150,
                        fg="rgb 0.0 0.0 0.0", bg="rgb 1.0 1.0 1.0")
+
+
+# ------------------------------------------------------- v0.9.0 unicode tier
+
+def test_rewrites_implies_iff_bigcup():
+    out = cli._preprocess_unicode(r"A \implies B \iff \bigcup_{i} C_i")
+    assert "\\Rightarrow" in out and "\\Leftrightarrow" in out
+    assert "\\cup_{i}" in out and "bigcup" not in out
+
+
+def test_rewrite_boundary_does_not_eat_longer_names():
+    # \implies must not rewrite inside \impliesfoo (hypothetical macro)
+    assert "\\Rightarrow" not in cli._preprocess_unicode(r"\impliesfoo")
+
+
+def test_hstack_centers_blocks():
+    out = cli._hstack([["A ="], ["1", "2", "3"]])
+    lines = out.split("\n")
+    assert len(lines) == 3
+    assert "A =" in lines[1]  # vertically centered
+
+
+needs_txc = pytest.mark.skipif(
+    not shutil.which("txc"), reason="TeXicode not installed"
+)
+
+
+@needs_txc
+def test_txc_try_detects_stdout_errors():
+    # txc reports errors on stdout with rc=0 — must read as failure
+    assert cli._txc_try(r"A = \begin{bmatrix} 1 \\ 2 \end{bmatrix}") is None
+    assert cli._txc_try("x + 1") is not None
+
+
+@needs_txc
+def test_txc_try_leading_minus():
+    assert cli._txc_try("-x") is not None
+
+
+@needs_txc
+def test_unicode_cases_renders_brace():
+    out = cli._unicode_cases(
+        r"|x| = \begin{cases} x & x \ge 0 \\ -x & x < 0 \end{cases}")
+    assert out is not None and "⎧" in out and "⎩" in out
+
+
+@needs_txc
+def test_unicode_matrix_embedded():
+    pytest.importorskip("sympy")
+    out = cli._unicode_matrix(
+        r"\det \begin{bmatrix} a & b \\ c & d \end{bmatrix} = ad - bc")
+    assert out is not None and "⎡" in out and "=" in out

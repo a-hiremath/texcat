@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 _RENDER_REV = 2  # bump when the render pipeline changes output for same input
 
 CACHE_DIR = os.path.join(
@@ -241,7 +241,24 @@ def render_png(
     os.makedirs(CACHE_DIR, exist_ok=True)
     with open(cached, "wb") as f:
         f.write(png)
+    _prune_cache()
     return png
+
+
+def _prune_cache(max_files: int = 400, keep: int = 300) -> None:
+    """Bound the render cache: content-hash keys only ever accumulate."""
+    try:
+        entries = [e for e in os.scandir(CACHE_DIR) if e.name.endswith(".png")]
+    except OSError:
+        return
+    if len(entries) <= max_files:
+        return
+    entries.sort(key=lambda e: e.stat().st_mtime)
+    for e in entries[: len(entries) - keep]:
+        try:
+            os.unlink(e.path)
+        except OSError:
+            pass
 
 
 # --------------------------------------------------------------------------
@@ -418,12 +435,88 @@ MATRIX_RE = re.compile(
     r"\\begin\{([pbvBV]?matrix)\}(.*?)\\end\{\1\}", re.DOTALL
 )
 
+CASES_RE = re.compile(r"\\begin\{cases\}(.*?)\\end\{cases\}", re.DOTALL)
+
+# rewrites for constructs TeXicode can't draw, into ones it can.
+# ([^{}]*) is deliberate: nested braces fall through to the next engine.
+_UNICODE_REWRITES = [
+    (re.compile(r"\\pmod\s*\{([^{}]*)\}"), r"\\ (\\mathrm{mod}\\ \1)"),
+    (re.compile(r"\\pmod\s+(\w+)"), r"\\ (\\mathrm{mod}\\ \1)"),
+    (re.compile(r"\\operatorname\s*\{([^{}]*)\}"), r"\\mathrm{\1}"),
+    (re.compile(r"\\overline\s*\{([^{}]*)\}"), r"\\bar{\1}"),
+    (re.compile(r"\\xrightarrow\s*\{([^{}]*)\}"), r"{\\to}^{\1}"),
+    (re.compile(r"\\xleftarrow\s*\{([^{}]*)\}"), r"{\\leftarrow}^{\1}"),
+    (re.compile(r"\\underbrace\s*\{([^{}]*)\}_\{([^{}]*)\}"), r"(\1)_{\2}"),
+    (re.compile(r"\\underbrace\s*\{([^{}]*)\}"), r"(\1)"),
+    (re.compile(r"\\overset\s*\{([^{}]*)\}\{([^{}]*)\}"), r"{\2}^{\1}"),
+    (re.compile(r"\\underset\s*\{([^{}]*)\}\{([^{}]*)\}"), r"{\2}_{\1}"),
+    (re.compile(r"\\stackrel\s*\{([^{}]*)\}\{([^{}]*)\}"), r"{\2}^{\1}"),
+    (re.compile(r"\\[dt]frac\b"), r"\\frac"),
+    (re.compile(r"\\displaystyle\b"), ""),
+    # arrows txc draws wrong (\iff -> single-bar) or not at all
+    (re.compile(r"\\implies(?![A-Za-z])"), r"\\Rightarrow"),
+    (re.compile(r"\\Longrightarrow(?![A-Za-z])"), r"\\Rightarrow"),
+    (re.compile(r"\\impliedby(?![A-Za-z])"), r"\\Leftarrow"),
+    (re.compile(r"\\Longleftarrow(?![A-Za-z])"), r"\\Leftarrow"),
+    (re.compile(r"\\iff(?![A-Za-z])"), r"\\Leftrightarrow"),
+    (re.compile(r"\\Longleftrightarrow(?![A-Za-z])"), r"\\Leftrightarrow"),
+    # big operators -> their binary forms (limits still attach)
+    (re.compile(r"\\bigcup(?![A-Za-z])"), r"\\cup"),
+    (re.compile(r"\\bigcap(?![A-Za-z])"), r"\\cap"),
+    (re.compile(r"\\bigoplus(?![A-Za-z])"), r"\\oplus"),
+    (re.compile(r"\\bigotimes(?![A-Za-z])"), r"\\otimes"),
+    (re.compile(r"\\bigvee(?![A-Za-z])"), r"\\vee"),
+    (re.compile(r"\\bigwedge(?![A-Za-z])"), r"\\wedge"),
+    (re.compile(r"\\overbrace\s*\{([^{}]*)\}\^\{([^{}]*)\}"), r"(\1)^{\2}"),
+    (re.compile(r"\\overbrace\s*\{([^{}]*)\}"), r"(\1)"),
+]
+
 
 def _preprocess_unicode(expr: str) -> str:
-    # TeXicode renders \pmod literally; expand it ourselves
-    expr = re.sub(r"\\pmod\s*\{([^}]*)\}", r"\\ (\\mathrm{mod}\\ \1)", expr)
-    expr = re.sub(r"\\pmod\s+(\w+)", r"\\ (\\mathrm{mod}\\ \1)", expr)
+    for pat, repl in _UNICODE_REWRITES:
+        expr = pat.sub(repl, expr)
     return expr
+
+
+def _txc_try(expr: str) -> str | None:
+    """Run TeXicode; return its art, or None on any failure.
+
+    NB: txc reports parse/render errors on STDOUT with exit code 0, so
+    neither the return code nor 'output is non-empty' means success —
+    the only reliable signal is the error prefix.
+    """
+    txc = shutil.which("txc")
+    if not txc:
+        return None
+    try:
+        # "--" so expressions like "-x" aren't parsed as txc flags
+        proc = subprocess.run(
+            [txc, "--", expr], capture_output=True, text=True, timeout=15
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    out = proc.stdout.rstrip("\n")
+    if (proc.returncode != 0 or not out.strip()
+            or out.lstrip().startswith("TeXicode:")):
+        return None
+    return out
+
+
+def _hstack(blocks: list[list[str]], gap: str = " ") -> str:
+    """Join multi-line text blocks side by side, vertically centered."""
+    heights = [len(b) for b in blocks]
+    total = max(heights)
+    cols = []
+    for block in blocks:
+        width = max((len(line) for line in block), default=0)
+        pad_top = (total - len(block)) // 2
+        col = [" " * width] * pad_top
+        col += [line.ljust(width) for line in block]
+        col += [" " * width] * (total - len(col))
+        cols.append(col)
+    return "\n".join(
+        gap.join(col[i] for col in cols).rstrip() for i in range(total)
+    )
 
 
 def _sympy_cell(cell: str):
@@ -442,54 +535,107 @@ def _sympy_cell(cell: str):
         return sympy.Symbol(cell or "?")
 
 
-def _unicode_matrix(expr: str) -> str | None:
-    """Render `lhs = <matrix>` or a bare matrix via sympy pretty-printing."""
-    m = MATRIX_RE.search(expr)
-    if not m:
-        return None
+def _matrix_block(body: str) -> list[str] | None:
+    """sympy-pretty a matrix env body ('1 & 2 \\\\ 3 & 4') into lines."""
     try:
         import sympy
     except ImportError:
         return None
     rows = [
         [_sympy_cell(c) for c in row.split("&")]
-        for row in m.group(2).strip().split("\\\\")
+        for row in body.strip().split("\\\\")
         if row.strip()
     ]
     try:
-        mat = sympy.Matrix(rows)
+        return sympy.pretty(sympy.Matrix(rows), use_unicode=True).splitlines()
     except Exception:
         return None
-    before = expr[: m.start()].strip().rstrip("=").strip()
-    after = expr[m.end() :].strip()
-    if after:  # matrix embedded mid-expression: too hard for this tier
+
+
+def _fragment_block(frag: str) -> list[str] | None:
+    """Render a non-matrix fragment (may be empty) into lines via txc."""
+    frag = frag.strip()
+    if not frag:
+        return []
+    art = _txc_try(frag)
+    return art.split("\n") if art is not None else None
+
+
+def _unicode_matrix(expr: str) -> str | None:
+    """Render expressions containing matrix environments by stitching
+    txc-rendered fragments around sympy-rendered matrix blocks."""
+    if not MATRIX_RE.search(expr):
         return None
-    rendered = sympy.pretty(mat, use_unicode=True)
-    if before:
-        pad = rendered.splitlines()
-        mid = len(pad) // 2
-        prefix = before + " = "
-        out = []
-        for i, line in enumerate(pad):
-            out.append((prefix if i == mid else " " * len(prefix)) + line)
-        return "\n".join(out)
-    return rendered
+    blocks: list[list[str]] = []
+    pos = 0
+    for m in MATRIX_RE.finditer(expr):
+        frag = _fragment_block(expr[pos:m.start()])
+        if frag is None:
+            return None
+        if frag:
+            blocks.append(frag)
+        mat = _matrix_block(m.group(2))
+        if mat is None:
+            return None
+        blocks.append(mat)
+        pos = m.end()
+    tail = _fragment_block(expr[pos:])
+    if tail is None:
+        return None
+    if tail:
+        blocks.append(tail)
+    return _hstack(blocks)
+
+
+def _unicode_cases(expr: str) -> str | None:
+    """Render \\begin{cases} with a real stretched brace."""
+    m = CASES_RE.search(expr)
+    if not m:
+        return None
+    rows = []
+    for row in m.group(1).strip().split("\\\\"):
+        if not row.strip():
+            continue
+        cells = row.split("&", 1)
+        val = _txc_try(cells[0].strip())
+        cond = _txc_try(cells[1].strip()) if len(cells) > 1 else ""
+        if val is None or cond is None:
+            return None
+        if "\n" in val or (cond and "\n" in cond):
+            return None  # multi-line cells: punt to the next engine
+        rows.append((val, cond or ""))
+    if len(rows) < 2:
+        return None
+    w = max(len(v) for v, _ in rows)
+    n = len(rows)
+    body = []
+    for i, (v, c) in enumerate(rows):
+        brace = "⎧" if i == 0 else "⎩" if i == n - 1 else (
+            "⎨" if i == n // 2 and n % 2 else "⎪")
+        body.append(f"{brace} {v.ljust(w)}   {c}".rstrip())
+    block = body
+    before = _fragment_block(expr[: m.start()])
+    after = _fragment_block(expr[m.end():])
+    if before is None or after is None:
+        return None
+    blocks = [b for b in (before, block, after) if b]
+    return _hstack(blocks)
 
 
 def render_unicode(expr: str) -> str:
     expr = _preprocess_unicode(expr)
 
+    cases = _unicode_cases(expr)
+    if cases is not None:
+        return cases
+
     mat = _unicode_matrix(expr)
     if mat is not None:
         return mat
 
-    txc = shutil.which("txc")
-    if txc:
-        proc = subprocess.run(
-            [txc, expr], capture_output=True, text=True, timeout=15
-        )
-        if proc.returncode == 0 and proc.stdout.strip():
-            return proc.stdout.rstrip("\n")
+    art = _txc_try(expr)
+    if art is not None:
+        return art
 
     try:
         import sympy
@@ -720,7 +866,78 @@ def listen_loop(args) -> int:
     print(f"push with: texcat --send '<latex>'   [feed: {FEED_PATH}]\n")
     vlog(f"viewer started pid={os.getpid()} proto={proto or 'none'}")
     theme_cache: dict[str, tuple[str, str]] = {}  # OSC query once, not per item
-    pos = os.path.getsize(FEED_PATH)  # only render NEW entries
+
+    def handle(line: str) -> None:
+        line = line.strip()
+        if not line:
+            return
+        try:
+            item = json.loads(line)
+        except ValueError:
+            item = {"tex": line}
+        cmd = item.get("cmd")
+        if cmd == "clear":
+            out = _tty_out()
+            if out is not None:
+                out.write(b"\x1b_Ga=d\x1b\\\x1b[2J\x1b[H")
+                out.flush()
+            print("texcat viewer — cleared\n")
+            vlog("cleared")
+            return
+        if cmd == "note":
+            note = str(item.get("text", ""))
+            print(f"\x1b[2m── {note} ──\x1b[0m")
+            vlog(f"note: {note[:70]}")
+            return
+        expr = item.get("tex", "")
+        if not expr.strip():
+            return
+        body = normalize(expr, inline=False)
+        try:
+            theme = item.get("theme", args.theme)
+            if theme not in theme_cache:
+                theme_cache[theme] = resolve_theme(theme)
+            fg, bg = theme_cache[theme]
+            png = render_png(
+                body, dpi=int(item.get("dpi", args.dpi)),
+                fg=fg, bg=bg,
+                packages=extra_packages(
+                    item.get("packages") or args.packages
+                ),
+            )
+            cols = fit_columns(png, item.get("cols") or args.cols)
+            shown = (
+                emit_kitty(png, cols) if proto == "kitty"
+                else emit_iterm(png, cols) if proto == "iterm"
+                else False
+            )
+            if not shown:
+                print(render_unicode(expr))
+            elif not args.plain:
+                src = " ".join(expr.split())
+                geo = tty_cell_geometry()
+                width = (geo[1] if geo else 80) - 4
+                if len(src) > width:
+                    src = src[: width - 1] + "…"
+                print(f"\x1b[2m{src}\x1b[0m")
+            vlog(f"rendered ({'pixels' if shown else 'unicode'}, "
+                 f"{len(png)}B png): {expr[:70]}")
+        except TexError as e:
+            print(f"⚠ TeX rejected: {expr[:60]}\n{e}\n")
+            print(render_unicode(expr))
+            vlog(f"TeX-rejected: {expr[:70]}")
+
+    pos = os.path.getsize(FEED_PATH)
+    if pos > 0:
+        with open(FEED_PATH) as f:
+            earlier = [ln for ln in f.read().splitlines() if ln.strip()]
+        if args.replay > 0:
+            for line in earlier[-args.replay:]:
+                handle(line)
+            vlog(f"replayed {min(args.replay, len(earlier))} entries")
+        elif earlier:
+            print(f"\x1b[2m({len(earlier)} earlier entries in feed — "
+                  f"texcat --listen --replay N re-renders the last N)\x1b[0m")
     try:
         while True:
             size = os.path.getsize(FEED_PATH)
@@ -732,68 +949,20 @@ def listen_loop(args) -> int:
                     lines = f.read()
                     pos = f.tell()
                 for line in lines.splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        item = json.loads(line)
-                    except ValueError:
-                        item = {"tex": line}
-                    cmd = item.get("cmd")
-                    if cmd == "clear":
-                        out = _tty_out()
-                        if out is not None:
-                            out.write(b"\x1b_Ga=d\x1b\\\x1b[2J\x1b[H")
-                            out.flush()
-                        print("texcat viewer — cleared\n")
-                        vlog("cleared")
-                        continue
-                    if cmd == "note":
-                        note = str(item.get("text", ""))
-                        print(f"\x1b[2m── {note} ──\x1b[0m")
-                        vlog(f"note: {note[:70]}")
-                        continue
-                    expr = item.get("tex", "")
-                    if not expr.strip():
-                        continue
-                    body = normalize(expr, inline=False)
-                    try:
-                        theme = item.get("theme", args.theme)
-                        if theme not in theme_cache:
-                            theme_cache[theme] = resolve_theme(theme)
-                        fg, bg = theme_cache[theme]
-                        png = render_png(
-                            body, dpi=int(item.get("dpi", args.dpi)),
-                            fg=fg, bg=bg,
-                            packages=extra_packages(
-                                item.get("packages") or args.packages
-                            ),
-                        )
-                        cols = fit_columns(png, item.get("cols") or args.cols)
-                        shown = (
-                            emit_kitty(png, cols) if proto == "kitty"
-                            else emit_iterm(png, cols) if proto == "iterm"
-                            else False
-                        )
-                        if not shown:
-                            print(render_unicode(expr))
-                        elif not args.plain:
-                            src = " ".join(expr.split())
-                            geo = tty_cell_geometry()
-                            width = (geo[1] if geo else 80) - 4
-                            if len(src) > width:
-                                src = src[: width - 1] + "…"
-                            print(f"\x1b[2m{src}\x1b[0m")
-                        vlog(f"rendered ({'pixels' if shown else 'unicode'}, "
-                             f"{len(png)}B png): {expr[:70]}")
-                    except TexError as e:
-                        print(f"⚠ TeX rejected: {expr[:60]}\n{e}\n")
-                        print(render_unicode(expr))
-                        vlog(f"TeX-rejected: {expr[:70]}")
+                    handle(line)
             time.sleep(0.2)
     except KeyboardInterrupt:
         print("\ntexcat viewer: bye")
         return 0
+
+
+def _viewer_running() -> bool:
+    try:
+        return subprocess.run(
+            ["pgrep", "-f", "texcat --listen"], capture_output=True, timeout=5
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def spawn_viewer_window() -> bool:
@@ -878,6 +1047,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="print a dim section note in the viewer")
     p.add_argument("--plain", action="store_true",
                    help="viewer: don't echo the LaTeX source under renders")
+    p.add_argument("--replay", type=int, default=0, metavar="N",
+                   help="viewer: re-render the last N feed entries on "
+                   "startup (default: skip old entries, print a notice)")
     p.add_argument("-V", "--version", action="version",
                    version=f"texcat {__version__}")
     args = p.parse_args(argv)
@@ -942,6 +1114,11 @@ def main(argv: list[str] | None = None) -> int:
         if not raw.strip():
             p.error("no LaTeX given")
         send_to_viewer(raw, args.theme, args.dpi, args.cols, args.packages)
+        if not _viewer_running():
+            print("texcat: warning: no viewer is listening — entry queued "
+                  "in the feed (start one with `texcat --viewer`, or "
+                  "`texcat --listen --replay 5` to catch up)",
+                  file=sys.stderr)
         return 0
 
     raw = read_input(args)
