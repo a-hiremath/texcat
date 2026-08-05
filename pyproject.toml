@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "texcat"
+version = "0.1.0"
+description = "Render LaTeX math in your terminal at Overleaf fidelity - real TeX to pixels via Kitty/iTerm2 graphics, Unicode art fallback everywhere else."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Adi Hiremath" }]
+keywords = ["latex", "terminal", "math", "kitty", "ghostty", "iterm2", "dvipng"]
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "Topic :: Text Processing :: Markup :: LaTeX",
+  "Topic :: Terminals",
+]
+
+[project.optional-dependencies]
+unicode = ["TeXicode", "sympy", "antlr4-python3-runtime==4.11"]
+
+[project.scripts]
+texcat = "texcat.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/a-hiremath/texcat"
+Issues = "https://github.com/a-hiremath/texcat/issues"
