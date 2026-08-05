@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 _RENDER_REV = 2  # bump when the render pipeline changes output for same input
 
 CACHE_DIR = os.path.join(
@@ -615,7 +615,7 @@ def _strip_math_block(block: str) -> str:
 
 def render_file_once(path: str, args, fg: str, bg: str) -> None:
     try:
-        text = open(path).read()
+        text = sys.stdin.read() if path == "-" else open(path).read()
     except OSError as e:
         print(f"texcat: cannot read {path}: {e}", file=sys.stderr)
         return
@@ -645,6 +645,9 @@ def render_file_once(path: str, args, fg: str, bg: str) -> None:
 
 def render_file(args) -> int:
     fg, bg = resolve_theme(args.theme)
+    if args.file == "-" and args.watch:
+        print("texcat: --watch needs a real file, not stdin", file=sys.stderr)
+        return 1
     if not args.watch:
         render_file_once(args.file, args, fg, bg)
         return 0
