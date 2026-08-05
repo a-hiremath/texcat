@@ -3,3 +3,8 @@ __pycache__/
 dist/
 build/
 .venv/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.pyc

@@ -60,6 +60,9 @@ texcat -t card '\nabla \times \mathbf{E} = -\frac{\partial \mathbf{B}}{\partial 
 # bigger render
 texcat -d 400 'e^{i\pi} + 1 = 0'
 
+# tighter or looser padding around the render
+texcat -b 2 '\int_0^1 x \, dx'   # default is 4pt
+
 # force the Unicode tier (works over SSH, in scripts, anywhere)
 texcat -u 'a^{p-1} \equiv 1 \pmod{p}'
 #  𝑎ᵖ⁻¹≡1 (mod 𝑝)
@@ -103,6 +106,15 @@ Unicode math renderers (we love [TeXicode](https://github.com/dxddxx/TeXicode), 
 ## Contributing
 
 Issues and PRs very welcome — this project wants co-maintainers. The whole tool is one file: [`texcat/cli.py`](texcat/cli.py).
+
+## Development
+
+```bash
+pip install -e ".[dev]"   # or: pip install -e ".[dev,unicode]"
+pytest                    # pixel-render tests skip gracefully when TeX is absent
+```
+
+The whole tool lives in [`texcat/cli.py`](texcat/cli.py); `tests/test_cli.py` covers the pure-logic core — input normalization, theme resolution, graphics-protocol detection, PNG sizing/auto-fit, markdown block extraction, the viewer feed, and CLI dispatch — and skips the latex/dvipng pipeline when TeX isn't installed, so the suite passes on any machine.
 
 ## Credits
 

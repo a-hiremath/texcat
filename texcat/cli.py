@@ -18,12 +18,27 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 _RENDER_REV = 2  # bump when the render pipeline changes output for same input
 
 CACHE_DIR = os.path.join(
     os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "texcat"
 )
+
+_DPI_MIN, _DPI_MAX = 50, 1200
+
+
+def _dpi_arg(value: str) -> int:
+    """argparse type: keep --dpi inside the range dvipng tolerates."""
+    try:
+        dpi = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(f"invalid dpi: {value!r}")
+    if not _DPI_MIN <= dpi <= _DPI_MAX:
+        raise argparse.ArgumentTypeError(
+            f"dpi must be between {_DPI_MIN} and {_DPI_MAX} (got {dpi})"
+        )
+    return dpi
 
 # environments that are already display-math environments (must not be
 # wrapped in \[ \])
@@ -475,7 +490,8 @@ def render_file_once(path: str, args, fg: str, bg: str) -> None:
             expr = _strip_math_block(part)
             body = normalize(expr, inline=False)
             try:
-                png = render_png(body, dpi=args.dpi, fg=fg, bg=bg)
+                png = render_png(body, dpi=args.dpi, fg=fg, bg=bg,
+                                border=args.border)
                 cols = fit_columns(png, args.cols)
                 shown = (
                     emit_kitty(png, cols) if proto == "kitty"
@@ -650,8 +666,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="force the Unicode-art tier (no graphics)")
     p.add_argument("-i", "--inline", action="store_true",
                    help="typeset in inline (text) style instead of display style")
-    p.add_argument("-d", "--dpi", type=int, default=280,
-                   help="render resolution (default 280; bump for bigger output)")
+    p.add_argument("-d", "--dpi", type=_dpi_arg, default=280,
+                   help="render resolution in dpi (default 280; range 50-1200)")
+    p.add_argument("-b", "--border", type=int, default=4,
+                   help="padding in pt around the render (default 4)")
     p.add_argument("-c", "--cols", type=int, default=None,
                    help="display width in terminal columns (default: natural "
                    "size, auto-shrunk to fit the window)")
@@ -718,7 +736,8 @@ def main(argv: list[str] | None = None) -> int:
     if wants_pixels:
         fg, bg = resolve_theme(args.theme)
         try:
-            png = render_png(body, dpi=args.dpi, fg=fg, bg=bg)
+            png = render_png(body, dpi=args.dpi, fg=fg, bg=bg,
+                            border=args.border)
         except TexError as e:
             print(f"texcat: TeX rejected the input:\n{e}", file=sys.stderr)
             print("texcat: falling back to Unicode tier\n", file=sys.stderr)
