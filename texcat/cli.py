@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 _RENDER_REV = 2  # bump when the render pipeline changes output for same input
 
 CACHE_DIR = os.path.join(
@@ -274,18 +274,68 @@ def _tty_out():
         return None
 
 
-def emit_kitty(png: bytes) -> bool:
+def png_size(png: bytes) -> tuple[int, int]:
+    """Width/height straight from the IHDR chunk — no decoder needed."""
+    import struct
+
+    if len(png) > 24 and png[:8] == b"\x89PNG\r\n\x1a\n":
+        w, h = struct.unpack(">II", png[16:24])
+        return w, h
+    return 0, 0
+
+
+def tty_cell_geometry() -> tuple[int, int, float] | None:
+    """(rows, cols, px_per_col) of the output terminal, if knowable."""
+    import fcntl
+    import struct
+    import termios
+
+    for fd in (1, 0, 2):
+        try:
+            ws = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8)
+            rows, cols, xp, yp = struct.unpack("HHHH", ws)
+            if cols > 0 and xp > 0:
+                return rows, cols, xp / cols
+            if cols > 0:
+                return rows, cols, 0.0
+        except OSError:
+            continue
+    return None
+
+
+def fit_columns(png: bytes, requested: int | None) -> int | None:
+    """Pick a c= column count so the image never overflows the window."""
+    if requested:
+        return requested
+    geo = tty_cell_geometry()
+    if not geo:
+        return None
+    _, cols, px_per_col = geo
+    if px_per_col <= 0:
+        return None
+    img_w, _ = png_size(png)
+    if not img_w:
+        return None
+    img_cols = img_w / px_per_col
+    max_cols = max(cols - 2, 10)
+    if img_cols > max_cols:
+        return max_cols
+    return None  # fits at natural size — keep it pixel-crisp
+
+
+def emit_kitty(png: bytes, cols: int | None = None) -> bool:
     out = _tty_out()
     if out is None:
         return False
     data = base64.standard_b64encode(png)
+    extra = f",c={cols}" if cols else ""
     first = True
     i = 0
     while i < len(data):
         chunk = data[i : i + 4096]
         i += 4096
         more = 1 if i < len(data) else 0
-        ctrl = f"a=T,f=100,m={more}" if first else f"m={more}"
+        ctrl = f"a=T,f=100,m={more}{extra}" if first else f"m={more}"
         out.write(b"\x1b_G" + ctrl.encode() + b";" + chunk + b"\x1b\\")
         first = False
     out.write(b"\n")
@@ -293,13 +343,14 @@ def emit_kitty(png: bytes) -> bool:
     return True
 
 
-def emit_iterm(png: bytes) -> bool:
+def emit_iterm(png: bytes, cols: int | None = None) -> bool:
     out = _tty_out()
     if out is None:
         return False
     b64 = base64.standard_b64encode(png)
+    width = b";width=%d" % cols if cols else b""
     out.write(
-        b"\x1b]1337;File=inline=1;size=%d:%s\x07\n" % (len(png), b64)
+        b"\x1b]1337;File=inline=1;size=%d%s:%s\x07\n" % (len(png), width, b64)
     )
     out.flush()
     return True
@@ -404,12 +455,17 @@ def render_unicode(expr: str) -> str:
 FEED_PATH = os.path.join(CACHE_DIR, "feed.jsonl")
 
 
-def send_to_viewer(expr: str, theme: str, dpi: int) -> None:
+def send_to_viewer(
+    expr: str, theme: str, dpi: int, cols: int | None = None
+) -> None:
     import json
 
     os.makedirs(CACHE_DIR, exist_ok=True)
+    item = {"tex": expr, "theme": theme, "dpi": dpi}
+    if cols:
+        item["cols"] = cols
     with open(FEED_PATH, "a") as f:
-        f.write(json.dumps({"tex": expr, "theme": theme, "dpi": dpi}) + "\n")
+        f.write(json.dumps(item) + "\n")
 
 
 def listen_loop(args) -> int:
@@ -433,6 +489,7 @@ def listen_loop(args) -> int:
     print("texcat viewer — waiting for math… (ctrl-c to quit)")
     print(f"push with: texcat --send '<latex>'   [feed: {FEED_PATH}]\n")
     vlog(f"viewer started pid={os.getpid()} proto={proto or 'none'}")
+    theme_cache: dict[str, tuple[str, str]] = {}  # OSC query once, not per item
     pos = os.path.getsize(FEED_PATH)  # only render NEW entries
     try:
         while True:
@@ -457,14 +514,18 @@ def listen_loop(args) -> int:
                         continue
                     body = normalize(expr, inline=False)
                     try:
-                        fg, bg = resolve_theme(item.get("theme", args.theme))
+                        theme = item.get("theme", args.theme)
+                        if theme not in theme_cache:
+                            theme_cache[theme] = resolve_theme(theme)
+                        fg, bg = theme_cache[theme]
                         png = render_png(
                             body, dpi=int(item.get("dpi", args.dpi)),
                             fg=fg, bg=bg,
                         )
+                        cols = fit_columns(png, item.get("cols") or args.cols)
                         shown = (
-                            emit_kitty(png) if proto == "kitty"
-                            else emit_iterm(png) if proto == "iterm"
+                            emit_kitty(png, cols) if proto == "kitty"
+                            else emit_iterm(png, cols) if proto == "iterm"
                             else False
                         )
                         if not shown:
@@ -518,6 +579,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="typeset in inline (text) style instead of display style")
     p.add_argument("-d", "--dpi", type=int, default=280,
                    help="render resolution (default 280; bump for bigger output)")
+    p.add_argument("-c", "--cols", type=int, default=None,
+                   help="display width in terminal columns (default: natural "
+                   "size, auto-shrunk to fit the window)")
     p.add_argument("-t", "--theme", choices=["auto", "card", "dark", "light"],
                    default="auto",
                    help="auto = match terminal bg (transparent); card = "
@@ -551,13 +615,13 @@ def main(argv: list[str] | None = None) -> int:
         import time
 
         time.sleep(2.0)  # give the listener a beat before the first send
-        send_to_viewer(" ".join(args.expr), args.theme, args.dpi)
+        send_to_viewer(" ".join(args.expr), args.theme, args.dpi, args.cols)
         return 0
     if args.send:
         raw = read_input(args)
         if not raw.strip():
             p.error("no LaTeX given")
-        send_to_viewer(raw, args.theme, args.dpi)
+        send_to_viewer(raw, args.theme, args.dpi, args.cols)
         return 0
 
     raw = read_input(args)
@@ -594,8 +658,9 @@ def main(argv: list[str] | None = None) -> int:
             subprocess.run([opener, path], check=False)
         if not args.out and not args.open:
             proto = graphics_protocol()
-            shown = emit_kitty(png) if proto == "kitty" else (
-                emit_iterm(png) if proto == "iterm" else False
+            cols = fit_columns(png, args.cols)
+            shown = emit_kitty(png, cols) if proto == "kitty" else (
+                emit_iterm(png, cols) if proto == "iterm" else False
             )
             if not shown:
                 print(render_unicode(raw))
