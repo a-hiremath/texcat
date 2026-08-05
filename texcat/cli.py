@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 _RENDER_REV = 2  # bump when the render pipeline changes output for same input
 
 CACHE_DIR = os.path.join(
@@ -503,6 +503,102 @@ def render_unicode(expr: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# HUD mode: float an equation over a TUI (e.g. Claude Code) on its own pty
+# --------------------------------------------------------------------------
+
+HUD_IMAGE_ID = 133742  # fixed id: every HUD send replaces the previous one
+
+
+def find_session_tty() -> str | None:
+    """Walk up the process tree to the pty this session is displayed on.
+    Works from TTY-less subprocesses (agent harnesses, launchd jobs)."""
+    pid = os.getpid()
+    for _ in range(20):
+        try:
+            out = subprocess.run(
+                ["ps", "-o", "tty=", "-o", "ppid=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.split()
+        except Exception:
+            return None
+        if len(out) < 2:
+            return None
+        tty, ppid = out[0], out[1]
+        if tty not in ("??", "-"):
+            return "/dev/" + tty
+        try:
+            pid = int(ppid)
+        except ValueError:
+            return None
+        if pid <= 1:
+            return None
+    return None
+
+
+def emit_hud(png: bytes, tty_path: str, z: int = 1000) -> bool:
+    """Overlay the image at the top-right of the target terminal.
+
+    The placement draws ABOVE text (z>0) and survives the TUI's repaints —
+    only scrolling or an explicit clear removes it. Cursor is saved/restored
+    and C=1 keeps the placement itself from moving it, so the host TUI's
+    cursor bookkeeping is undisturbed.
+    """
+    import fcntl
+    import struct
+    import termios
+
+    try:
+        fd = os.open(tty_path, os.O_WRONLY | os.O_NOCTTY)
+    except OSError:
+        return False
+    try:
+        col = 1
+        try:
+            ws = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8)
+            _, cols, xp, _ = struct.unpack("HHHH", ws)
+            img_w, _h = png_size(png)
+            if cols and xp and img_w:
+                img_cols = int(img_w / (xp / cols)) + 1
+                col = max(1, cols - img_cols)
+        except OSError:
+            pass
+        data = base64.standard_b64encode(png)
+        buf = bytearray()
+        buf += b"\x1b7"                      # save cursor
+        buf += b"\x1b[1;%dH" % col           # park at row 1, right-aligned
+        first = True
+        i = 0
+        while i < len(data):
+            chunk = data[i : i + 4096]
+            i += 4096
+            more = 1 if i < len(data) else 0
+            if first:
+                ctrl = (f"a=T,f=100,q=2,C=1,z={z},"
+                        f"i={HUD_IMAGE_ID},p=1,m={more}")
+            else:
+                ctrl = f"m={more}"
+            buf += b"\x1b_G" + ctrl.encode() + b";" + chunk + b"\x1b\\"
+            first = False
+        buf += b"\x1b8"                      # restore cursor
+        os.write(fd, bytes(buf))
+        return True
+    finally:
+        os.close(fd)
+
+
+def emit_hud_clear(tty_path: str) -> bool:
+    try:
+        fd = os.open(tty_path, os.O_WRONLY | os.O_NOCTTY)
+    except OSError:
+        return False
+    try:
+        os.write(fd, b"\x1b_Ga=d,d=i,i=%d,q=2\x1b\\" % HUD_IMAGE_ID)
+        return True
+    finally:
+        os.close(fd)
+
+
+# --------------------------------------------------------------------------
 # markdown file mode: -f / --watch
 # --------------------------------------------------------------------------
 
@@ -764,6 +860,15 @@ def main(argv: list[str] | None = None) -> int:
                    "instead of rendering here")
     p.add_argument("--viewer", action="store_true",
                    help="open a new terminal window running --listen (macOS)")
+    p.add_argument("--hud", action="store_true",
+                   help="float the equation over THIS session's terminal "
+                   "(top-right, above the TUI) — works even from TTY-less "
+                   "subprocesses like agent harnesses")
+    p.add_argument("--hud-clear", action="store_true",
+                   help="remove the HUD overlay")
+    p.add_argument("--tty", metavar="/dev/ttysNNN",
+                   help="target pty for --hud (default: auto-detect via "
+                   "process ancestry)")
     p.add_argument("--send-clear", action="store_true",
                    help="tell the viewer to clear its screen")
     p.add_argument("--send-note", metavar="TEXT",
@@ -790,6 +895,33 @@ def main(argv: list[str] | None = None) -> int:
         send_to_viewer(" ".join(args.expr), args.theme, args.dpi,
                        args.cols, args.packages)
         return 0
+    if args.hud or args.hud_clear:
+        tty_path = args.tty or find_session_tty()
+        if not tty_path:
+            print("texcat: --hud: could not locate a session tty "
+                  "(pass --tty /dev/ttysNNN)", file=sys.stderr)
+            return 1
+        if args.hud_clear and not (args.hud or args.expr):
+            ok = emit_hud_clear(tty_path)
+            print(f"texcat: HUD cleared on {tty_path}" if ok
+                  else f"texcat: cannot write {tty_path}", file=sys.stderr)
+            return 0 if ok else 1
+        raw = read_input(args)
+        if not raw.strip():
+            p.error("no LaTeX given")
+        theme = "card" if args.theme == "auto" else args.theme
+        fg, bg = resolve_theme(theme)
+        try:
+            png = render_png(normalize(raw, inline=args.inline),
+                             dpi=args.dpi, fg=fg, bg=bg,
+                             packages=extra_packages(args.packages))
+        except TexError as e:
+            print(f"texcat: TeX rejected the input:\n{e}", file=sys.stderr)
+            return 1
+        ok = emit_hud(png, tty_path)
+        print(f"texcat: HUD placed on {tty_path}" if ok
+              else f"texcat: cannot write {tty_path}", file=sys.stderr)
+        return 0 if ok else 1
     if args.send_clear or args.send_note:
         import json
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "texcat"
-version = "0.6.0"
+version = "0.7.0"
 description = "Render LaTeX math in your terminal at Overleaf fidelity - real TeX to pixels via Kitty/iTerm2 graphics, Unicode art fallback everywhere else."
 readme = "README.md"
 requires-python = ">=3.9"
