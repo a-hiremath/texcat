@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 _RENDER_REV = 2  # bump when the render pipeline changes output for same input
 
 CACHE_DIR = os.path.join(
@@ -640,6 +640,20 @@ def listen_loop(args) -> int:
                         item = json.loads(line)
                     except ValueError:
                         item = {"tex": line}
+                    cmd = item.get("cmd")
+                    if cmd == "clear":
+                        out = _tty_out()
+                        if out is not None:
+                            out.write(b"\x1b_Ga=d\x1b\\\x1b[2J\x1b[H")
+                            out.flush()
+                        print("texcat viewer — cleared\n")
+                        vlog("cleared")
+                        continue
+                    if cmd == "note":
+                        note = str(item.get("text", ""))
+                        print(f"\x1b[2m── {note} ──\x1b[0m")
+                        vlog(f"note: {note[:70]}")
+                        continue
                     expr = item.get("tex", "")
                     if not expr.strip():
                         continue
@@ -664,6 +678,13 @@ def listen_loop(args) -> int:
                         )
                         if not shown:
                             print(render_unicode(expr))
+                        elif not args.plain:
+                            src = " ".join(expr.split())
+                            geo = tty_cell_geometry()
+                            width = (geo[1] if geo else 80) - 4
+                            if len(src) > width:
+                                src = src[: width - 1] + "…"
+                            print(f"\x1b[2m{src}\x1b[0m")
                         vlog(f"rendered ({'pixels' if shown else 'unicode'}, "
                              f"{len(png)}B png): {expr[:70]}")
                     except TexError as e:
@@ -743,6 +764,12 @@ def main(argv: list[str] | None = None) -> int:
                    "instead of rendering here")
     p.add_argument("--viewer", action="store_true",
                    help="open a new terminal window running --listen (macOS)")
+    p.add_argument("--send-clear", action="store_true",
+                   help="tell the viewer to clear its screen")
+    p.add_argument("--send-note", metavar="TEXT",
+                   help="print a dim section note in the viewer")
+    p.add_argument("--plain", action="store_true",
+                   help="viewer: don't echo the LaTeX source under renders")
     p.add_argument("-V", "--version", action="version",
                    version=f"texcat {__version__}")
     args = p.parse_args(argv)
@@ -763,6 +790,18 @@ def main(argv: list[str] | None = None) -> int:
         send_to_viewer(" ".join(args.expr), args.theme, args.dpi,
                        args.cols, args.packages)
         return 0
+    if args.send_clear or args.send_note:
+        import json
+
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(FEED_PATH, "a") as f:
+            if args.send_clear:
+                f.write(json.dumps({"cmd": "clear"}) + "\n")
+            if args.send_note:
+                f.write(json.dumps({"cmd": "note", "text": args.send_note})
+                        + "\n")
+        if not args.expr and not args.send:
+            return 0
     if args.send:
         raw = read_input(args)
         if not raw.strip():
