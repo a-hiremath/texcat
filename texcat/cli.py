@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 _RENDER_REV = 2  # bump when the render pipeline changes output for same input
 
 CACHE_DIR = os.path.join(
@@ -449,6 +449,79 @@ def render_unicode(expr: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# markdown file mode: -f / --watch
+# --------------------------------------------------------------------------
+
+MD_MATH_RE = re.compile(
+    r"(\$\$.*?\$\$|\\\[.*?\\\]|```math\n.*?```)", re.DOTALL
+)
+
+
+def _strip_math_block(block: str) -> str:
+    if block.startswith("```math"):
+        return block[len("```math"):].strip("`\n ")
+    return block  # $$..$$ / \[..\] are stripped by normalize()
+
+
+def render_file_once(path: str, args, fg: str, bg: str) -> None:
+    try:
+        text = open(path).read()
+    except OSError as e:
+        print(f"texcat: cannot read {path}: {e}", file=sys.stderr)
+        return
+    proto = graphics_protocol()
+    for part in MD_MATH_RE.split(text):
+        if MD_MATH_RE.fullmatch(part):
+            expr = _strip_math_block(part)
+            body = normalize(expr, inline=False)
+            try:
+                png = render_png(body, dpi=args.dpi, fg=fg, bg=bg)
+                cols = fit_columns(png, args.cols)
+                shown = (
+                    emit_kitty(png, cols) if proto == "kitty"
+                    else emit_iterm(png, cols) if proto == "iterm"
+                    else False
+                )
+                if not shown:
+                    print(render_unicode(expr))
+            except TexError as e:
+                print(f"⚠ TeX rejected block:\n{e}")
+                print(render_unicode(expr))
+        else:
+            sys.stdout.write(part)
+            sys.stdout.flush()
+
+
+def render_file(args) -> int:
+    fg, bg = resolve_theme(args.theme)
+    if not args.watch:
+        render_file_once(args.file, args, fg, bg)
+        return 0
+    import time
+
+    print(f"texcat: watching {args.file} — ctrl-c to quit")
+    last = 0.0
+    try:
+        while True:
+            try:
+                mtime = os.path.getmtime(args.file)
+            except OSError:
+                time.sleep(0.3)
+                continue
+            if mtime != last:
+                last = mtime
+                out = _tty_out()
+                if out is not None:
+                    # delete kitty images, then clear + home
+                    out.write(b"\x1b_Ga=d\x1b\\\x1b[2J\x1b[H")
+                    out.flush()
+                render_file_once(args.file, args, fg, bg)
+            time.sleep(0.3)
+    except KeyboardInterrupt:
+        return 0
+
+
+# --------------------------------------------------------------------------
 # live viewer: --listen / --send
 # --------------------------------------------------------------------------
 
@@ -592,6 +665,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="open the render in the system image viewer")
     p.add_argument("--source", action="store_true",
                    help="also echo the LaTeX source beneath the render")
+    p.add_argument("-f", "--file", metavar="MD",
+                   help="render a markdown/text file: display-math blocks "
+                   "($$…$$, \\[…\\], ```math fences) become typeset images, "
+                   "prose passes through")
+    p.add_argument("--watch", action="store_true",
+                   help="with -f: re-render on every save (live preview)")
     p.add_argument("--listen", action="store_true",
                    help="run as a live viewer: render everything pushed to "
                    "the feed (use in a spare terminal window/split)")
@@ -606,6 +685,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.listen:
         return listen_loop(args)
+    if args.file:
+        return render_file(args)
     if args.viewer:
         ok = spawn_viewer_window()
         print("texcat: viewer window opened" if ok
