@@ -96,6 +96,23 @@ mathclaude "derive the closed form for the sum of the first n squares"
 
 Prose comes through as text; display math lands as Overleaf-grade pixels, inline, permanently. Works with any CLI that emits markdown math.
 
+Caveat: `--continue` resumes the *most recent* `-p` conversation in the current directory — fine for a dedicated math shell, wrong if you run other headless sessions there. The robust version pins its own session:
+
+```zsh
+mathclaude() {
+  local sid=~/.cache/texcat/mathclaude.session out=/tmp/mathclaude.json
+  if [[ -s $sid ]]; then
+    claude -p -r "$(<$sid)" --output-format json "$*" > "$out"
+  else
+    claude -p --output-format json "$*" > "$out"
+  fi
+  jq -r '.session_id' "$out" > "$sid"
+  jq -r '.result' "$out" | texcat -f -
+}
+```
+
+Also worth exploring: `claude --ax-screen-reader` renders the *interactive* session as flat text (no TUI boxes/animations, full interactivity retained) — a calmer surface that may tolerate inline graphics injection far better than the default TUI. Reports welcome.
+
 ## HUD — float math over a TUI
 
 `texcat --hud '<latex>'` renders the equation and floats it over the **top-right of the terminal this session lives in** — even when invoked from a TTY-less subprocess (agent harness, make, launchd): it finds the session's pty through process ancestry and places a z-topped, cursor-neutral overlay that survives the host TUI's repaints. `--hud-clear` removes it; each new `--hud` replaces the last.
