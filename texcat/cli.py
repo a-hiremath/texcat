@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 _RENDER_REV = 2  # bump when the render pipeline changes output for same input
 
 CACHE_DIR = os.path.join(
@@ -398,6 +398,109 @@ def render_unicode(expr: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# live viewer: --listen / --send
+# --------------------------------------------------------------------------
+
+FEED_PATH = os.path.join(CACHE_DIR, "feed.jsonl")
+
+
+def send_to_viewer(expr: str, theme: str, dpi: int) -> None:
+    import json
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with open(FEED_PATH, "a") as f:
+        f.write(json.dumps({"tex": expr, "theme": theme, "dpi": dpi}) + "\n")
+
+
+def listen_loop(args) -> int:
+    """Run as a live math viewport: render every expression appended to the
+    feed file. Meant to run in its own terminal window/split, e.g.:
+
+        open -na Ghostty --args -e texcat --listen
+    """
+    import json
+    import time
+
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    open(FEED_PATH, "a").close()  # ensure it exists
+    proto = graphics_protocol()
+    log_path = os.path.join(CACHE_DIR, "viewer.log")
+
+    def vlog(msg: str) -> None:
+        with open(log_path, "a") as lf:
+            lf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+
+    print("texcat viewer — waiting for math… (ctrl-c to quit)")
+    print(f"push with: texcat --send '<latex>'   [feed: {FEED_PATH}]\n")
+    vlog(f"viewer started pid={os.getpid()} proto={proto or 'none'}")
+    pos = os.path.getsize(FEED_PATH)  # only render NEW entries
+    try:
+        while True:
+            size = os.path.getsize(FEED_PATH)
+            if size < pos:  # feed was truncated/rotated
+                pos = 0
+            if size > pos:
+                with open(FEED_PATH) as f:
+                    f.seek(pos)
+                    lines = f.read()
+                    pos = f.tell()
+                for line in lines.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except ValueError:
+                        item = {"tex": line}
+                    expr = item.get("tex", "")
+                    if not expr.strip():
+                        continue
+                    body = normalize(expr, inline=False)
+                    try:
+                        fg, bg = resolve_theme(item.get("theme", args.theme))
+                        png = render_png(
+                            body, dpi=int(item.get("dpi", args.dpi)),
+                            fg=fg, bg=bg,
+                        )
+                        shown = (
+                            emit_kitty(png) if proto == "kitty"
+                            else emit_iterm(png) if proto == "iterm"
+                            else False
+                        )
+                        if not shown:
+                            print(render_unicode(expr))
+                        vlog(f"rendered ({'pixels' if shown else 'unicode'}, "
+                             f"{len(png)}B png): {expr[:70]}")
+                    except TexError as e:
+                        print(f"⚠ TeX rejected: {expr[:60]}\n{e}\n")
+                        print(render_unicode(expr))
+                        vlog(f"TeX-rejected: {expr[:70]}")
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        print("\ntexcat viewer: bye")
+        return 0
+
+
+def spawn_viewer_window() -> bool:
+    """Best-effort: open a new terminal window running the viewer (macOS)."""
+    if sys.platform != "darwin":
+        return False
+    term = os.environ.get("TERM_PROGRAM", "")
+    if "ghostty" in term.lower() or "ghostty" in os.environ.get("TERM", ""):
+        app = "Ghostty"
+    elif term == "iTerm.app":
+        app = "iTerm"
+    else:
+        app = "Ghostty"
+    exe = shutil.which("texcat") or "texcat"
+    r = subprocess.run(
+        ["open", "-na", app, "--args", "-e", exe, "--listen"],
+        capture_output=True,
+    )
+    return r.returncode == 0
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -425,9 +528,37 @@ def main(argv: list[str] | None = None) -> int:
                    help="open the render in the system image viewer")
     p.add_argument("--source", action="store_true",
                    help="also echo the LaTeX source beneath the render")
+    p.add_argument("--listen", action="store_true",
+                   help="run as a live viewer: render everything pushed to "
+                   "the feed (use in a spare terminal window/split)")
+    p.add_argument("--send", action="store_true",
+                   help="push the expression to a running --listen viewer "
+                   "instead of rendering here")
+    p.add_argument("--viewer", action="store_true",
+                   help="open a new terminal window running --listen (macOS)")
     p.add_argument("-V", "--version", action="version",
                    version=f"texcat {__version__}")
     args = p.parse_args(argv)
+
+    if args.listen:
+        return listen_loop(args)
+    if args.viewer:
+        ok = spawn_viewer_window()
+        print("texcat: viewer window opened" if ok
+              else "texcat: could not open viewer window", file=sys.stderr)
+        if not args.expr:
+            return 0 if ok else 1
+        import time
+
+        time.sleep(2.0)  # give the listener a beat before the first send
+        send_to_viewer(" ".join(args.expr), args.theme, args.dpi)
+        return 0
+    if args.send:
+        raw = read_input(args)
+        if not raw.strip():
+            p.error("no LaTeX given")
+        send_to_viewer(raw, args.theme, args.dpi)
+        return 0
 
     raw = read_input(args)
     if not raw.strip():

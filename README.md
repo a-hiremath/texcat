@@ -71,6 +71,19 @@ texcat -o eq.png 'x = \frac{-b \pm \sqrt{b^2-4ac}}{2a}'
 texcat --open '\begin{align*} a &= b \\ &= c \end{align*}'
 ```
 
+## Live viewer — pixel math beside your AI agent
+
+TUI apps repaint their screens, and their subprocesses often have **no TTY at all** — so inline graphics can't survive *inside* an AI coding agent like Claude Code. The viewer sidesteps that: keep a tiny `texcat --listen` window next to your session, and anything can push equations into it through a feed file. The viewer owns a real TTY with graphics support, so every push renders as genuine typeset TeX the instant it lands.
+
+```bash
+texcat --viewer                      # opens a new terminal window running the viewer (macOS)
+# ...or run `texcat --listen` yourself in any spare split/window
+
+texcat --send 'e^{i\pi} + 1 = 0'     # from anywhere — your agent, a script, vim — renders instantly
+```
+
+Tell your AI agent to `texcat --send` its display math and you get an Overleaf-quality math sidebar for your conversation. Renders are logged to `~/.cache/texcat/viewer.log`, so even a headless agent can verify its math actually displayed.
+
 ## Why not just Unicode art?
 
 Unicode math renderers (we love [TeXicode](https://github.com/dxddxx/TeXicode), and use it as our fallback tier) are great for simple expressions, but they hit a ceiling: matrices, multi-line alignments, radicals over fractions, struts and spacing — a character grid can only do so much. Modern terminals can draw pixels. If your terminal can show a picture, it can show *real typeset math*.
@@ -85,7 +98,7 @@ Unicode math renderers (we love [TeXicode](https://github.com/dxddxx/TeXicode), 
 - [ ] Markdown mode: render every `$$...$$` block in a file (`texcat -f notes.md`)
 - [ ] Sixel backend (older terminals)
 - [ ] Font size in terminal-cell units (`--cols 40`)
-- [ ] Persistent daemon for sub-100ms renders
+- [ ] Linux support for `--viewer` (the `--listen`/`--send` pair is already portable)
 
 ## Contributing
 
