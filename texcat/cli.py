@@ -18,7 +18,7 @@ import subprocess
 import sys
 import tempfile
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 _RENDER_REV = 2  # bump when the render pipeline changes output for same input
 
 CACHE_DIR = os.path.join(
@@ -32,14 +32,25 @@ TOP_LEVEL_ENVS = re.compile(
     r"|alignat\*?|flalign\*?|equation\*?)\}"
 )
 
-TEX_TEMPLATE = r"""\documentclass[preview,border=%(border)spt]{standalone}
-\usepackage{amsmath}
-\usepackage{amssymb}
-\usepackage{mathtools}
-\begin{document}
-%(body)s
-\end{document}
-"""
+BASE_PACKAGES = ["amsmath", "amssymb", "mathtools"]
+
+_PKG_OK = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def extra_packages(args_packages: str | None) -> list[str]:
+    raw = args_packages or os.environ.get("TEXCAT_PACKAGES", "")
+    return [p.strip() for p in raw.split(",")
+            if p.strip() and _PKG_OK.match(p.strip())]
+
+
+def build_doc(body: str, border: int, packages: list[str]) -> tuple[str, str]:
+    """Return (full document, preamble) — the preamble keys the .fmt cache."""
+    lines = [r"\documentclass[preview,border=%dpt]{standalone}" % border]
+    for p in BASE_PACKAGES + [p for p in packages if p not in BASE_PACKAGES]:
+        lines.append(r"\usepackage{%s}" % p)
+    preamble = "\n".join(lines)
+    doc = preamble + "\n\\begin{document}\n" + body + "\n\\end{document}\n"
+    return doc, preamble
 
 
 # --------------------------------------------------------------------------
@@ -128,16 +139,45 @@ def _autocrop(png: bytes, pad: int = 12) -> bytes:
     return out.getvalue()
 
 
+def _ensure_format(latex: str, preamble: str) -> str | None:
+    """Precompile the preamble into a .fmt once; later runs skip parsing it.
+    Returns the cached .fmt path, or None if the build failed (plain runs
+    still work)."""
+    fmt_key = hashlib.sha256(preamble.encode()).hexdigest()[:16]
+    fmt_path = os.path.join(CACHE_DIR, f"pre-{fmt_key}.fmt")
+    fail_marker = fmt_path + ".failed"
+    if os.path.exists(fmt_path):
+        return fmt_path
+    if os.path.exists(fail_marker):
+        return None
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="texcat-fmt-") as tmp:
+        with open(os.path.join(tmp, "job.tex"), "w") as f:
+            f.write(preamble + "\n\\begin{document}\nx\n\\end{document}\n")
+        proc = subprocess.run(
+            [latex, "-ini", "-interaction=nonstopmode", "-jobname=pre",
+             "&latex", "mylatexformat.ltx", "job.tex"],
+            cwd=tmp, capture_output=True, timeout=60,
+        )
+        built = os.path.join(tmp, "pre.fmt")
+        if proc.returncode == 0 and os.path.exists(built):
+            shutil.move(built, fmt_path)
+            return fmt_path
+    open(fail_marker, "w").close()
+    return None
+
+
 def render_png(
     body: str,
     dpi: int,
     fg: str,
     bg: str,
     border: int = 4,
+    packages: list[str] | None = None,
 ) -> bytes:
-    doc = TEX_TEMPLATE % {"body": body, "border": border}
+    doc, preamble = build_doc(body, border, packages or [])
     key = hashlib.sha256(
-        f"{doc}|{dpi}|{fg}|{bg}|{__version__}|r{_RENDER_REV}".encode()
+        f"{doc}|{dpi}|{fg}|{bg}|r{_RENDER_REV}".encode()
     ).hexdigest()[:24]
     cached = os.path.join(CACHE_DIR, key + ".png")
     if os.path.exists(cached):
@@ -152,16 +192,30 @@ def render_png(
             "pixel rendering, or use --unicode"
         )
 
+    fmt_path = _ensure_format(latex, preamble)
+
     with tempfile.TemporaryDirectory(prefix="texcat-") as tmp:
         tex_path = os.path.join(tmp, "job.tex")
         with open(tex_path, "w") as f:
             f.write(doc)
-        proc = subprocess.run(
-            [latex, "-interaction=nonstopmode", "-halt-on-error", "job.tex"],
-            cwd=tmp,
-            capture_output=True,
-            timeout=30,
-        )
+
+        def run_latex(with_fmt: bool):
+            cmd = [latex]
+            if with_fmt and fmt_path:
+                os.symlink(fmt_path, os.path.join(tmp, "texcatpre.fmt"))
+                cmd += ["-fmt", "texcatpre"]
+            cmd += ["-interaction=nonstopmode", "-halt-on-error", "job.tex"]
+            return subprocess.run(cmd, cwd=tmp, capture_output=True, timeout=30)
+
+        proc = run_latex(with_fmt=True)
+        if proc.returncode != 0 and fmt_path:
+            # stale/broken format: drop it and retry plain
+            try:
+                os.unlink(fmt_path)
+            except OSError:
+                pass
+            fmt_path = None
+            proc = run_latex(with_fmt=False)
         if proc.returncode != 0:
             raise TexError(_tex_error_from_log(os.path.join(tmp, "job.log")))
         proc = subprocess.run(
@@ -475,7 +529,8 @@ def render_file_once(path: str, args, fg: str, bg: str) -> None:
             expr = _strip_math_block(part)
             body = normalize(expr, inline=False)
             try:
-                png = render_png(body, dpi=args.dpi, fg=fg, bg=bg)
+                png = render_png(body, dpi=args.dpi, fg=fg, bg=bg,
+                                 packages=extra_packages(args.packages))
                 cols = fit_columns(png, args.cols)
                 shown = (
                     emit_kitty(png, cols) if proto == "kitty"
@@ -529,7 +584,8 @@ FEED_PATH = os.path.join(CACHE_DIR, "feed.jsonl")
 
 
 def send_to_viewer(
-    expr: str, theme: str, dpi: int, cols: int | None = None
+    expr: str, theme: str, dpi: int,
+    cols: int | None = None, packages: str | None = None,
 ) -> None:
     import json
 
@@ -537,6 +593,8 @@ def send_to_viewer(
     item = {"tex": expr, "theme": theme, "dpi": dpi}
     if cols:
         item["cols"] = cols
+    if packages:
+        item["packages"] = packages
     with open(FEED_PATH, "a") as f:
         f.write(json.dumps(item) + "\n")
 
@@ -594,6 +652,9 @@ def listen_loop(args) -> int:
                         png = render_png(
                             body, dpi=int(item.get("dpi", args.dpi)),
                             fg=fg, bg=bg,
+                            packages=extra_packages(
+                                item.get("packages") or args.packages
+                            ),
                         )
                         cols = fit_columns(png, item.get("cols") or args.cols)
                         shown = (
@@ -655,6 +716,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("-c", "--cols", type=int, default=None,
                    help="display width in terminal columns (default: natural "
                    "size, auto-shrunk to fit the window)")
+    p.add_argument("-p", "--packages", metavar="P1,P2",
+                   help="extra LaTeX packages to load (also via "
+                   "TEXCAT_PACKAGES env), e.g. physics,siunitx")
     p.add_argument("-t", "--theme", choices=["auto", "card", "dark", "light"],
                    default="auto",
                    help="auto = match terminal bg (transparent); card = "
@@ -696,13 +760,14 @@ def main(argv: list[str] | None = None) -> int:
         import time
 
         time.sleep(2.0)  # give the listener a beat before the first send
-        send_to_viewer(" ".join(args.expr), args.theme, args.dpi, args.cols)
+        send_to_viewer(" ".join(args.expr), args.theme, args.dpi,
+                       args.cols, args.packages)
         return 0
     if args.send:
         raw = read_input(args)
         if not raw.strip():
             p.error("no LaTeX given")
-        send_to_viewer(raw, args.theme, args.dpi, args.cols)
+        send_to_viewer(raw, args.theme, args.dpi, args.cols, args.packages)
         return 0
 
     raw = read_input(args)
@@ -718,7 +783,8 @@ def main(argv: list[str] | None = None) -> int:
     if wants_pixels:
         fg, bg = resolve_theme(args.theme)
         try:
-            png = render_png(body, dpi=args.dpi, fg=fg, bg=bg)
+            png = render_png(body, dpi=args.dpi, fg=fg, bg=bg,
+                             packages=extra_packages(args.packages))
         except TexError as e:
             print(f"texcat: TeX rejected the input:\n{e}", file=sys.stderr)
             print("texcat: falling back to Unicode tier\n", file=sys.stderr)
